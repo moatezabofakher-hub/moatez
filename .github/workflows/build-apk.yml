@@ -1,0 +1,147 @@
+name: Build SAN SHINE Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Audit and Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Restore Android project folders if files were uploaded flat
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f app/build.gradle && -f app/src/main/assets/www/index.html ]]; then
+            echo 'Project folder structure already correct.'
+          else
+            echo 'Flat GitHub upload detected: restoring app and tests folders.'
+            for source in MainActivity.java AndroidManifest.xml index.html icons.js tailwind.css ic_launcher.xml check_project.py test_accounting.js test_signed_licenses.js; do
+              if [[ ! -s "$source" ]]; then
+                echo "::error::Missing $source. Upload the complete PUBLIC project ZIP contents, keeping folders."
+                exit 1
+              fi
+            done
+            mkdir -p app/src/main/java/com/sunshine/accounting
+            mkdir -p app/src/main/assets/www/static
+            mkdir -p app/src/main/res/drawable
+            mkdir -p tests
+            cp MainActivity.java app/src/main/java/com/sunshine/accounting/MainActivity.java
+            cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+            cp index.html app/src/main/assets/www/index.html
+            cp icons.js app/src/main/assets/www/static/icons.js
+            cp tailwind.css app/src/main/assets/www/static/tailwind.css
+            cp ic_launcher.xml app/src/main/res/drawable/ic_launcher.xml
+            cp check_project.py tests/check_project.py
+            cp test_accounting.js tests/test_accounting.js
+            cp test_signed_licenses.js tests/test_signed_licenses.js
+            cat > app/build.gradle <<'GRADLE'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.sunshine.accounting'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.sunshine.accounting'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 3
+                  versionName '3.0-signed-licenses'
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+                  debug { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              lint { abortOnError true }
+          }
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+              implementation 'androidx.biometric:biometric:1.1.0'
+              implementation 'androidx.fragment:fragment:1.6.2'
+          }
+          GRADLE
+          fi
+          test -s app/build.gradle
+          test -s app/src/main/assets/www/index.html
+          echo 'Android project files ready.'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK without discontinued tools package
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android API 35
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+
+      - name: Install Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Validate project files and biometric bridge
+        run: python3 tests/check_project.py
+
+      - name: Check JavaScript syntax
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          html = Path('app/src/main/assets/www/index.html').read_text(encoding='utf-8')
+          scripts = re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>', html, re.I)
+          Path('/tmp/sunshine-inline.js').write_text('\n'.join(scripts), encoding='utf-8')
+          PYCODE
+          node --check /tmp/sunshine-inline.js
+          node --check app/src/main/assets/www/static/icons.js
+
+      - name: Run accounting tests
+        run: node tests/test_accounting.js
+
+      - name: Run signed license security tests
+        run: node tests/test_signed_licenses.js
+
+      - name: Build Android debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee build-log.txt
+
+      - name: Confirm APK created
+        run: test -s app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAN-SHINE-Android-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic log if compilation failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAN-SHINE-build-error-log
+          path: build-log.txt
+          if-no-files-found: ignore
+          retention-days: 7
